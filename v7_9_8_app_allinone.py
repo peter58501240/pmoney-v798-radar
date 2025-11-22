@@ -789,7 +789,7 @@ max_price = st.sidebar.number_input("股價上限 (§3.1)", value=80.0, step=5.0
 min_vol = st.sidebar.number_input("當日成交量下限 (張)", value=1000)
 
 st.sidebar.divider()
-st.sidebar.info("💡 全揭露模式：所有掃描過的股票都會列出，並顯示 Universe / Firm / 分層原因，方便檢視『死在哪一關』。")
+st.sidebar.info("💡 **全揭露模式**：所有掃描過的股票都會列出，並顯示 Universe / Firm / 分層原因，方便檢視「死在哪一關」。")
 
 
 if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
@@ -862,4 +862,66 @@ if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
                     "ROE": roe_percent,
                     "OPM": opm_percent,
                     "Score": score.total,
-                    "Univers
+                    "UniverseOK": universe.passed,
+                    "FirmCount": firm.count,
+                    "LayerReason": cls.extra_info.get("reason", ""),
+                    "E候選": "⭐" if cls.is_e_candidate else "",
+                    "VolumeFilter": volume_filter_ok,
+                }
+            )
+        except Exception:
+            continue
+
+    progress_bar.empty()
+    status_text.empty()
+
+    # --- 顯示結果 ---
+    if results:
+        df = pd.DataFrame(results)
+
+        # 分級排序
+        grade_order = {"A": 0, "B": 1, "C": 2, "D": 3, "X": 4}
+        df["grade_sort"] = df["評級"].map(grade_order).fillna(4)
+        df = df.sort_values(by=["grade_sort", "Score", "成交量"], ascending=[True, False, False])
+
+        a_count = int((df["評級"] == "A").sum())
+        b_count = int((df["評級"] == "B").sum())
+
+        st.info(f"掃描完成！A級: **{a_count}** 檔, B級: **{b_count}** 檔")
+
+        st.dataframe(
+            df[
+                [
+                    "代號",
+                    "名稱",
+                    "評級",
+                    "E候選",
+                    "收盤價",
+                    "成交量",
+                    "基本面",
+                    "技術面",
+                    "價格符合",
+                    "ROE",
+                    "OPM",
+                    "Score",
+                    "LayerReason",
+                ]
+            ],
+            use_container_width=True,
+        )
+
+        # --- 建議操作區 ---
+        st.markdown("### 📋 v7.9.8 建議操作（僅供參考，實際仍以完整規則＋日報為準）")
+        valid_stocks = df[df["評級"].isin(["A", "B"])]
+
+        if not valid_stocks.empty:
+            for _, row in valid_stocks.iterrows():
+                action = "市價買進 (整張)" if row["評級"] == "A" else "半單位買進"
+                st.success(
+                    f"**[{row['評級']}級] {row['名稱']} ({row['代號']})** | 收盤: {row['收盤價']} | ROE: {row['ROE']} | Score: {row['Score']}\n\n"
+                    f"👉 **建議**: 隔日開盤 {action}，技術停損參考：全域 -12% ＋ T15/保本/SDR 由本地 Pmoney 引擎執行。"
+                )
+        else:
+            st.warning("今日無 A/B 級標的。")
+    else:
+        st.error("掃描結果為空。")
