@@ -1,16 +1,3 @@
-"""
-v7.9.8 選股雷達 - 整合版 (規則引擎 + Pmoney 風格爬蟲 + 安全氣囊)
-
-執行方式:
-    streamlit run v7_9_8_app_allinone.py
-
-說明:
-    - 這支檔案同時包含：
-        1) v7.9.8 規則核心：Universe / Firm / Score / A–D + E 候選分層
-        2) Pmoney 風格的 TWSE / TPEx 成交量掃描
-        3) 安全氣囊 SAFE_LIST：當官方 API 完全連不上時才使用
-"""
-
 from __future__ import annotations
 
 import datetime as dt
@@ -46,10 +33,6 @@ class Layer(str, Enum):
 class StockSnapshot:
     """
     單一股票在評估當日的「快照」。
-
-    注意：
-    - 這裡只放「選股當下需要」的欄位（不含持有成本、最高價等出場相關欄位）。
-    - 數值一律以「小數」表示（例如 ROE = 0.15 表示 15%）。
     """
 
     # 識別
@@ -406,6 +389,13 @@ def classify_stock(
                 if s.opm_ttm is not None and s.opm_ttm >= 0.02:
                     cond_bottom += 1
 
+                rev_avg = 0.0
+                cnt = 0
+                for x in (s.revenue_yoy_m1, s.revenue_yoy_m2, s.revenue_yoy_m3):
+                    if x is not None:
+                        rev_avg += x
+                        cnt += 1
+                rev_avg = rev_avg / cnt if cnt > 0 else 0.0
                 if rev_avg >= -0.03:
                     cond_bottom += 1
 
@@ -431,7 +421,7 @@ def classify_stock(
 
 
 # ============================================================
-# 2. 成交量掃描爬蟲 (TWSE + TPEX + Yahoo + 安全氣囊)
+# 2. 成交量掃描爬蟲 (TWSE + TPEX + Yahoo)
 # ============================================================
 
 UA = {
@@ -452,126 +442,181 @@ def _fmt_int(x):
         return None
 
 
-def _taipei_anchor_date() -> dt.date:
-    """決定抓取資料的基準日 (下午3點前抓昨天)"""
+def _smart_trade_date() -> dt.date:
+    """
+    參照 VBA GetTop100_JSON_Final 的日期邏輯：
+    - 週六抓週五
+    - 週日抓週五
+    - 週一盤中 (<15:00) 抓上週五
+    - 其他平日盤中 (<15:00) 抓前一個交易日
+    - 其餘時間抓當天
+    """
     now = dt.datetime.now()
     if ZoneInfo:
         try:
             now = dt.datetime.now(ZoneInfo("Asia/Taipei"))
         except Exception:
             pass
+
     d = now.date()
-    if now.hour < 15:
+    wd = d.weekday()  # Monday=0 ... Sunday=6
+
+    # 週六 -> 週五
+    if wd == 5:
         d = d - dt.timedelta(days=1)
+    # 週日 -> 週五
+    elif wd == 6:
+        d = d - dt.timedelta(days=2)
+    # 週一盤中 -> 上週五
+    elif wd == 0 and now.hour < 15:
+        d = d - dt.timedelta(days=3)
+    # 其他平日盤中 -> 昨天
+    elif now.hour < 15 and wd <= 4:
+        d = d - dt.timedelta(days=1)
+
     return d
 
 
 def fetch_twse_json(yyyymmdd: str):
-    urls = [
-        (
-            "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX",
-            {"date": yyyymmdd, "type": "ALLBUT0999", "response": "json"},
-        ),
-        (
-            "https://www.twse.com.tw/exchangeReport/MI_INDEX",
-            {"date": yyyymmdd, "type": "ALLBUT0999", "response": "json"},
-        ),
-    ]
+    """
+    上市：exchangeReport/MI_INDEX?response=json&type=ALLBUT0999
+    """
+    url = "https://www.twse.com.tw/exchangeReport/MI_INDEX"
+    params = {
+        "response": "json",
+        "date": yyyymmdd,
+        "type": "ALLBUT0999",
+    }
     s = requests.Session()
     s.headers.update(UA)
     s.headers.update(TWSE_REF)
-
-    for url, params in urls:
-        try:
-            r = s.get(url, params=params, timeout=10)
-            if r.status_code == 200:
-                j = r.json()
-                if isinstance(j, dict) and (j.get("stat") == "OK" or "tables" in j):
-                    return j
-        except Exception:
-            continue
+    try:
+        r = s.get(url, params=params, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        return None
     return None
 
 
-def parse_twse_top_by_volume(j: dict) -> List[Dict[str, Any]]:
+def parse_twse_top_by_volume(j: dict):
+    """
+    解析 TWSE JSON：
+    - 先找含「證券代號 / 證券名稱 / 成交股數」的表
+    - 回傳 symbol(.TW) / name / volume(股數)
+    """
     rows: List[Dict[str, Any]] = []
-    if isinstance(j, dict):
-        tables = j.get("tables", [])
-        target_table = None
+
+    if not isinstance(j, dict):
+        return rows
+
+    # 新版 rwd 格式：tables[]
+    tables = j.get("tables")
+    if isinstance(tables, list) and tables:
         for t in tables:
             fields = t.get("fields", [])
+            data = t.get("data", [])
             if "證券代號" in fields and "成交股數" in fields:
-                target_table = t
-                break
+                id_i = fields.index("證券代號")
+                name_i = fields.index("證券名稱")
+                vol_i = fields.index("成交股數")
+                for row in data:
+                    sid = str(row[id_i]).strip()
+                    if len(sid) != 4 or not sid.isdigit():
+                        continue
+                    vol = _fmt_int(row[vol_i])
+                    if vol is None:
+                        continue
+                    rows.append(
+                        {
+                            "symbol": f"{sid}.TW",
+                            "name": row[name_i],
+                            "volume": vol,
+                            "market": "上市",
+                        }
+                    )
+        if rows:
+            return rows
 
-        if target_table:
-            fields = target_table["fields"]
-            data = target_table["data"]
-            id_i = fields.index("證券代號")
-            name_i = fields.index("證券名稱")
-            vol_i = fields.index("成交股數")
+    # 舊版 exchangeReport 格式：dataX / fieldsX
+    for key, value in j.items():
+        if not (isinstance(key, str) and key.startswith("data")):
+            continue
+        if not isinstance(value, list):
+            continue
 
-            for row in data:
-                sid = str(row[id_i]).strip()
-                if len(sid) != 4:
-                    continue
-                vol = _fmt_int(row[vol_i])
-                if vol is None:
-                    continue
+        idx = key[4:]
+        fields = j.get(f"fields{idx}", [])
+        if "證券代號" not in fields or "成交股數" not in fields:
+            continue
 
-                rows.append(
-                    {
-                        "symbol": f"{sid}.TW",
-                        "name": row[name_i],
-                        "volume": vol,
-                        "market": "上市",
-                    }
-                )
+        id_i = fields.index("證券代號")
+        name_i = fields.index("證券名稱")
+        vol_i = fields.index("成交股數")
+
+        for row in value:
+            if not isinstance(row, list):
+                continue
+            if len(row) <= max(id_i, name_i, vol_i):
+                continue
+            sid = str(row[id_i]).strip()
+            if len(sid) != 4 or not sid.isdigit():
+                continue
+            vol = _fmt_int(row[vol_i])
+            if vol is None:
+                continue
+            rows.append(
+                {
+                    "symbol": f"{sid}.TW",
+                    "name": row[name_i],
+                    "volume": vol,
+                    "market": "上市",
+                }
+            )
+
     return rows
 
 
 def fetch_tpex_json(roc_date: str):
-    urls = [
-        (
-            "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php",
-            {"l": "zh-tw", "d": roc_date, "s": "0,asc,0"},
-        ),
-        (
-            "https://www.tpex.org.tw/www/stock/aftertrading/daily_close_quotes/stk_quote_result.php",
-            {"l": "zh-tw", "d": roc_date, "s": "0,asc,0"},
-        ),
-    ]
+    """
+    上櫃：stk_quote_result.php?l=zh-tw&o=json&d=ROC_DATE
+    """
+    url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php"
+    params = {
+        "l": "zh-tw",
+        "o": "json",
+        "d": roc_date,
+    }
     s = requests.Session()
     s.headers.update(UA)
     s.headers.update(TPEX_REF)
-
-    for url, params in urls:
-        try:
-            r = s.get(url, params=params, timeout=10)
-            if r.status_code == 200:
-                j = r.json()
-                if isinstance(j, dict) and j.get("aaData"):
-                    return j
-        except Exception:
-            continue
+    try:
+        r = s.get(url, params=params, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        return None
     return None
 
 
-def parse_tpex_top_by_volume(j: dict) -> List[Dict[str, Any]]:
+def parse_tpex_top_by_volume(j: dict):
+    """
+    解析 TPEx JSON (aaData)：
+    - 0=代號, 1=名稱, 8=成交股數
+    """
     rows: List[Dict[str, Any]] = []
     if not isinstance(j, dict):
         return rows
-    data = j.get("aaData", [])
 
+    data = j.get("aaData", [])
     for row in data:
         try:
             sid = str(row[0]).strip()
-            if len(sid) != 4:
+            if len(sid) != 4 or not sid.isdigit():
                 continue
             vol = _fmt_int(row[8])
             if vol is None:
                 continue
-
             rows.append(
                 {
                     "symbol": f"{sid}.TWO",
@@ -585,8 +630,10 @@ def parse_tpex_top_by_volume(j: dict) -> List[Dict[str, Any]]:
     return rows
 
 
-def yahoo_fallback(topn: int) -> List[Dict[str, Any]]:
-    """Yahoo Finance 備援爬蟲"""
+def yahoo_fallback(topn: int):
+    """
+    Yahoo Finance 熱門股備援（仍是線上資料）
+    """
     try:
         url = f"https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?count={topn*2}&scrIds=most_actives_tw"
         r = requests.get(url, headers=UA, timeout=10)
@@ -604,7 +651,7 @@ def yahoo_fallback(topn: int) -> List[Dict[str, Any]]:
                 {
                     "symbol": sym,
                     "name": q.get("shortName", sid),
-                    "volume": q.get("regularMarketVolume", 0),
+                    "volume": int(q.get("regularMarketVolume", 0)),
                     "market": "Yahoo熱門",
                 }
             )
@@ -613,62 +660,41 @@ def yahoo_fallback(topn: int) -> List[Dict[str, Any]]:
         return []
 
 
-# 安全氣囊：官方/ Yahoo 全部失敗時使用
-SAFE_LIST = [
-    "2330.TW", "2317.TW", "2603.TW", "2609.TW", "2615.TW", "2881.TW", "2882.TW",
-    "2303.TW", "3231.TW", "2382.TW", "2454.TW", "3711.TW", "2891.TW", "2886.TW",
-    "2892.TW", "5880.TW", "2884.TW", "1605.TW", "2002.TW", "2409.TW", "3481.TW",
-    "2618.TW", "2610.TW", "3037.TW", "2371.TW", "2356.TW", "2324.TW", "5347.TWO",
-    "6182.TWO", "8069.TWO",
-]
-
-
 @st.cache_data(ttl=1800)
 def get_market_scan_list(limit: int):
     """
-    嘗試抓取「上市＋上櫃」的成交量排行。
-
-    優先順序：
-    1. TWSE 官方 MI_INDEX
-    2. TPEx 官方 daily_close_quotes
-    3. Yahoo 熱門股 screener
-    4. SAFE_LIST 安全氣囊（連線受阻時才用）
+    取得市場掃描清單：
+    1. 優先 TWSE + TPEx（照 VBA 日期與 URL）
+    2. 官方都掛掉 → 改走 Yahoo 熱門股
+    3. 連 Yahoo 都掛掉 → 回傳空，讓 UI 直接報錯
     """
-    d = _taipei_anchor_date()
+    d = _smart_trade_date()
+    yyyymmdd = d.strftime("%Y%m%d")
+    roc_date = f"{d.year - 1911}/{d.month:02d}/{d.day:02d}"
 
-    # 1) TWSE + TPEx
-    for _ in range(5):  # 最多回溯 5 個交易日
-        while d.weekday() >= 5:  # 跳過週末
-            d = d - dt.timedelta(days=1)
+    rows_tw: List[Dict[str, Any]] = []
+    rows_tp: List[Dict[str, Any]] = []
 
-        date_str = d.strftime("%Y-%m-%d")
-        roc_date = f"{d.year-1911}/{d.month:02d}/{d.day:02d}"
+    j_tw = fetch_twse_json(yyyymmdd)
+    if j_tw:
+        rows_tw = parse_twse_top_by_volume(j_tw)
 
-        j_tw = fetch_twse_json(d.strftime("%Y%m%d"))
-        rows_tw = parse_twse_top_by_volume(j_tw) if j_tw else []
+    j_tp = fetch_tpex_json(roc_date)
+    if j_tp:
+        rows_tp = parse_tpex_top_by_volume(j_tp)
 
-        j_tp = fetch_tpex_json(roc_date)
-        rows_tp = parse_tpex_top_by_volume(j_tp) if j_tp else []
+    if rows_tw or rows_tp:
+        all_data = rows_tw + rows_tp
+        all_data.sort(key=lambda x: x["volume"], reverse=True)
+        return all_data[: limit * 2], d.strftime("%Y-%m-%d")
 
-        if rows_tw or rows_tp:
-            all_data = rows_tw + rows_tp
-            all_data.sort(key=lambda x: x["volume"], reverse=True)
-            return all_data[: limit * 2], date_str
-
-        d = d - dt.timedelta(days=1)
-
-    # 2) Yahoo 熱門股備援
+    # 官方都掛掉 -> 改走 Yahoo（仍為線上資料）
     yahoo_rows = yahoo_fallback(limit)
     if yahoo_rows:
         return yahoo_rows, "Yahoo即時(備援)"
 
-    # 3) 全部失敗 → SAFE_LIST 安全氣囊
-    fallback_targets: List[Dict[str, Any]] = []
-    for sym in SAFE_LIST[:limit]:
-        fallback_targets.append(
-            {"symbol": sym, "name": "熱門備用", "volume": 0, "market": "備用"}
-        )
-    return fallback_targets, "備用清單(連線受阻)"
+    # 連 Yahoo 都掛掉 -> 回傳空
+    return [], d.strftime("%Y-%m-%d")
 
 
 # ============================================================
@@ -680,10 +706,6 @@ def build_snapshot_from_yfinance(
 ) -> Optional[StockSnapshot]:
     """
     將 yfinance 的 info + history 轉成 StockSnapshot。
-
-    注意：
-    - 月營收 YoY、RS60、法人等字段在雲端 demo 中以近似值或 None 處理，
-      正式環境建議改由本機 Pmoney 資料管線提供。
     """
     if history is None or history.empty or len(history) < 240:
         return None
@@ -703,7 +725,7 @@ def build_snapshot_from_yfinance(
     # 近 20 日平均成交金額
     turnover_20 = float((hist["Close"] * hist["Volume"]).tail(20).mean())
 
-    # 近 20 日換手率 (volume / sharesOutstanding 的近似)
+    # 近 20 日換手率
     shares_out = info.get("sharesOutstanding") or None
     if isinstance(shares_out, (int, float)) and shares_out > 0:
         avg_vol20 = float(hist["Volume"].tail(20).mean())
@@ -779,7 +801,7 @@ def build_snapshot_from_yfinance(
         net_income_growth_3m=net_income_growth_3m,
         npl_ratio=None,
         coverage_ratio=None,
-        rs60=50.0,  # demo 先給中性值
+        rs60=50.0,
         industry=industry,
         industry_index_price=None,
         industry_index_ma60=None,
@@ -800,7 +822,7 @@ st.set_page_config(page_title="v7.9.8 選股雷達", page_icon="🎯", layout="w
 st.title("🎯 v7.9.8 投資規則 - 嚴格篩選雷達（單檔整合版）")
 st.markdown(
     """
-**核心精神：** 以 v7.9.8 規則為主軸，整合 Pmoney 成交量掃描與完整 Universe / Firm / 分層邏輯，對熱門標的進行初篩。  
+**核心精神：** 以 v7.9.8 規則為主軸，整合成交量掃描與完整 Universe / Firm / 分層邏輯，對熱門標的進行初篩。  
 - **§3.1 / §3.1-F 基本面：** ROE>10%、OPM≥5%、營收成長、負債比、(金融股: NPL / Coverage / EPS/淨利成長)  
 - **§3.5 流動性：** 20 日均額 ≥ 5,000 萬、20 日換手率 ≥ 0.3%  
 - **§3.2 Firm：** 站上季線與年線、量能放大、趨勢溢價、族群同步  
@@ -818,11 +840,11 @@ st.sidebar.info("💡 全揭露模式：所有掃描過的股票都會列出，�
 
 if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
     # 1. 取得成交量排行清單
-    with st.spinner("Pmoney 引擎正在抓取成交量排行..."):
+    with st.spinner("正在抓取上市＋上櫃成交量排行..."):
         target_list, data_date = get_market_scan_list(scan_limit)
 
     if not target_list:
-        st.error("無法取得市場資料，請稍後再試。")
+        st.error("無法取得市場資料（TWSE/TPEx/Yahoo 皆連線失敗），請稍後再試。")
         st.stop()
 
     st.success(f"資料來源：{data_date}｜掃描標的數：{len(target_list)} 檔。開始逐檔健檢...")
@@ -849,7 +871,7 @@ if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
             last = hist.iloc[-1]
             vol_lots_today = float(last["Volume"]) / 1000.0
             if vol_lots_today < float(min_vol):
-                # 當日量不足，可以直接跳過或標示為 VolumeFail
+                # 當日量不足，可直接跳過
                 continue
 
             info = ticker.info or {}
@@ -857,13 +879,12 @@ if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
             if snapshot is None:
                 continue
 
-            # 非金融套股價上限；金融股 price_cap 用預設但函式內實際不檢查
             price_cap = max_price if not snapshot.is_financial else PRICE_CAP_DEFAULT
 
             universe = check_universe(snapshot, price_cap=price_cap)
             firm = check_firm(snapshot)
             score = calculate_score(snapshot, firm)
-            cls = classify_stock(snapshot, universe, firm, score)
+            cls = classify_stock(snapshot, universe, firm)
 
             grade = cls.layer.value
             price = round(snapshot.close, 2)
@@ -940,7 +961,7 @@ if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
                 action = "市價買進 (整張)" if row["評級"] == "A" else "半單位買進"
                 st.success(
                     f"**[{row['評級']}級] {row['名稱']} ({row['代號']})** | 收盤: {row['收盤價']} | ROE: {row['ROE']} | Score: {row['Score']}\n\n"
-                    f"👉 建議：隔日開盤 {action}，技術停損參考全域 -12% ＋ T15/保本/SDR 由本機 Pmoney 引擎執行。"
+                    f"👉 建議：隔日開盤 {action}，技術停損暫以 -12% ＋ SDR 由本機 Pmoney 引擎執行。"
                 )
         else:
             st.warning("今日無 A/B 級標的。")
