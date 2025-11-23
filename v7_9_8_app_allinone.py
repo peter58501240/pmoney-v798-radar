@@ -7,8 +7,8 @@ from typing import Optional, Dict, Any, List
 
 import pandas as pd
 import requests
-import streamlit as st
 import yfinance as yf
+import streamlit as st
 
 try:
     from zoneinfo import ZoneInfo
@@ -17,71 +17,15 @@ except ImportError:
 
 
 # ============================================================
-# 1. v7.9.8 規則引擎 (Universe / Firm / Score / 分層)
+# 1. 基本型別與評分結構
 # ============================================================
 
 class Layer(str, Enum):
-    """§6 分層結果（選股用）"""
     A = "A"
     B = "B"
     C = "C"
     D = "D"
-    ELIMINATED = "X"   # 未通過 Universe 或不符合任一層級
-
-
-@dataclass
-class StockSnapshot:
-    """
-    單一股票在評估當日的「快照」。
-    """
-
-    # 識別
-    symbol: str
-    name: str
-
-    # 類別
-    is_financial: bool       # 是否金融股（銀行/保險等）
-    is_cyclical: bool        # 是否循環股（鋼鐵/塑化/航運/面板/DRAM 等）
-
-    # 價量與均線
-    close: float             # 收盤價
-    volume: float            # 成交量（股數）
-    ma20: float
-    ma60: float
-    ma240: float
-
-    # 流動性與市值（§3.5 + §3.1）
-    avg_turnover_20: float   # 近 20 日平均成交金額 (TWD)
-    turnover_ratio_20: float # 近 20 日平均換手率（0–1）
-    market_cap: float        # 市值 (TWD)
-
-    # 非金融基本面（§3.1）
-    roe_ttm: float           # ROE(TTM)
-    opm_ttm: float           # OPM(TTM)
-    debt_ratio: float        # 負債比
-    revenue_yoy_m1: float    # 最近 1 月營收 YoY（近似值）
-    revenue_yoy_m2: float    # 最近 2 月營收 YoY（近似值）
-    revenue_yoy_m3: float    # 最近 3 月營收 YoY（近似值）
-
-    # 成長與品質延伸（§8）
-    eps_growth_4q: float         # 近 4 季 EPS 成長率
-    net_income_growth_3m: float  # 近 3 月淨利成長率
-
-    # 金融股專用（§3.1-F）
-    npl_ratio: Optional[float] = None          # NPL
-    coverage_ratio: Optional[float] = None     # 覆蓋率
-
-    # 動能／相對強弱
-    rs60: float = 50.0                         # RS(60) 百分位（0–100）
-
-    # 族群與法人（Firm / E 層使用）
-    industry: Optional[str] = None
-    industry_index_price: Optional[float] = None
-    industry_index_ma60: Optional[float] = None
-    industry_up_ratio_5d: Optional[float] = None   # 近 5 日產業上漲家數占比（0–1）
-    inst_net_buy_20: Optional[float] = None        # 近 20 日法人合計淨買超金額 (TWD)
-    industry_rank_by_size: Optional[int] = None    # 產業內市值或營收排名（1=最大）
-    last_quarter_growth: Optional[float] = None    # 最近一季營收或 EPS YoY（E 層用）
+    X = "X"   # 淘汰 / 不符合
 
 
 @dataclass
@@ -97,8 +41,8 @@ class FirmResult:
     f_volume: bool
     f_trend: bool
     f_group: bool
-    count: int          # N_F
-    is_firm: bool       # 四面齊
+    count: int
+    is_firm: bool
 
 
 @dataclass
@@ -115,131 +59,79 @@ class ClassificationResult:
     symbol: str
     name: str
     layer: Layer
-    is_e_candidate: bool
     universe: UniverseResult
     firm: FirmResult
     score: ScoreResult
-    extra_info: Dict[str, Any]
+    is_e_candidate: bool
+    extra_reason: str
 
 
-# 規則常數（依 v7.9.8）
-PRICE_CAP_DEFAULT = 80.0
-MIN_TURNOVER_20 = 50_000_000     # 近 20 日均額 ≥ 5,000 萬
-MIN_TURNOVER_RATIO_20 = 0.003    # 近 20 日換手率 ≥ 0.3%
-MIN_MARKET_CAP = 1_000_000_000   # 市值 ≥ 10 億
+@dataclass
+class StockSnapshot:
+    symbol: str
+    name: str
+    close: float
+    volume: float
+    ma20: float
+    ma60: float
+    ma240: Optional[float]
+    market_cap: float
+    roe: float
+    opm: float
+    rev_growth: float
+    debt_ratio: float
+    is_financial: bool
 
 
-def _check_universe_non_financial(
-    s: StockSnapshot,
-    price_cap: float = PRICE_CAP_DEFAULT
-) -> UniverseResult:
-    """§3.1 非金融 Universe 濾網"""
+# ============================================================
+# 2. 規則邏輯 (v7.9.8 精簡實作)
+# ============================================================
+
+MIN_MKT_CAP = 1_000_000_000   # 市值 ≥ 10 億
+
+
+def check_universe(s: StockSnapshot, price_cap: float) -> UniverseResult:
     checks: Dict[str, bool] = {}
 
-    checks["price"] = s.close <= price_cap
-    checks["market_cap"] = s.market_cap >= MIN_MARKET_CAP
-
-    checks["revenue_3m_yoy"] = (
-        s.revenue_yoy_m1 is not None
-        and s.revenue_yoy_m2 is not None
-        and s.revenue_yoy_m3 is not None
-        and s.revenue_yoy_m1 >= 0.05
-        and s.revenue_yoy_m2 >= 0.05
-        and s.revenue_yoy_m3 >= 0.05
-    )
-
-    checks["roe"] = s.roe_ttm is not None and s.roe_ttm > 0.10
-    checks["opm"] = s.opm_ttm is not None and s.opm_ttm >= 0.05
-    checks["debt_ratio"] = (s.debt_ratio is not None) and (s.debt_ratio < 0.60)
-
-    checks["turnover_20"] = (s.avg_turnover_20 is not None) and (s.avg_turnover_20 >= MIN_TURNOVER_20)
-    checks["turnover_ratio_20"] = (s.turnover_ratio_20 is not None) and (s.turnover_ratio_20 >= MIN_TURNOVER_RATIO_20)
-
-    passed = all(checks.values())
-    reason = "OK" if passed else "Non-financial universe filter failed"
-    return UniverseResult(passed=passed, reason=reason, checks=checks)
-
-
-def _check_universe_financial(
-    s: StockSnapshot,
-    price_cap: float = PRICE_CAP_DEFAULT
-) -> UniverseResult:
-    """§3.1-F 金融股 Universe 濾網"""
-    checks: Dict[str, bool] = {}
-
-    # 金融股不套價格上限
-    checks["price"] = True
-    checks["market_cap"] = s.market_cap >= MIN_MARKET_CAP
-    checks["roe"] = s.roe_ttm is not None and s.roe_ttm > 0.10
-
-    if s.npl_ratio is None:
-        checks["npl"] = False
-    else:
-        checks["npl"] = s.npl_ratio < 0.01
-
-    if s.coverage_ratio is None:
-        checks["coverage"] = False
-    else:
-        checks["coverage"] = s.coverage_ratio > 1.0
-
-    checks["growth"] = (
-        (s.eps_growth_4q is not None and s.eps_growth_4q >= 0.05)
-        or (s.net_income_growth_3m is not None and s.net_income_growth_3m >= 0.05)
-    )
-
-    checks["turnover_20"] = (s.avg_turnover_20 is not None) and (s.avg_turnover_20 >= MIN_TURNOVER_20)
-    checks["turnover_ratio_20"] = (s.turnover_ratio_20 is not None) and (s.turnover_ratio_20 >= MIN_TURNOVER_RATIO_20)
-
-    passed = all(checks.values())
-    reason = "OK" if passed else "Financial universe filter failed"
-    return UniverseResult(passed=passed, reason=reason, checks=checks)
-
-
-def check_universe(
-    s: StockSnapshot,
-    price_cap: float = PRICE_CAP_DEFAULT
-) -> UniverseResult:
-    """依是否金融股，呼叫對應 Universe 濾網"""
+    # 非金融才套股價上限
     if s.is_financial:
-        return _check_universe_financial(s, price_cap=price_cap)
+        checks["price"] = True
     else:
-        return _check_universe_non_financial(s, price_cap=price_cap)
+        checks["price"] = s.close <= price_cap
+
+    checks["mkt_cap"] = s.market_cap >= MIN_MKT_CAP
+    checks["roe"] = s.roe > 0.10
+    checks["opm"] = s.opm >= 0.05
+    checks["rev"] = s.rev_growth >= 0.05
+    checks["debt"] = s.debt_ratio < 0.60 if s.debt_ratio >= 0 else True
+
+    passed = all(checks.values())
+    reason = "OK" if passed else "Universe not passed"
+    return UniverseResult(passed=passed, reason=reason, checks=checks)
 
 
 def check_firm(s: StockSnapshot) -> FirmResult:
-    """§3.2 Firm 動能四面齊"""
-    # 價格：收盤 > 60MA 且 > 240MA
-    f_price = (
-        (s.close is not None) and (s.ma60 is not None) and (s.ma240 is not None)
-        and (s.close > s.ma60) and (s.close > s.ma240)
-    )
-
-    # 量能：當日金額 >= 1.5 × 20 日均額
-    if s.avg_turnover_20 is not None and s.close is not None:
-        today_turnover = s.close * s.volume
-        f_volume = today_turnover >= 1.5 * s.avg_turnover_20
+    # 價格：>60MA & 若有年線則也要 >240MA
+    if s.ma240 is not None and s.ma240 > 0:
+        f_price = (s.close > s.ma60) and (s.close > s.ma240)
     else:
-        f_volume = False
+        f_price = s.close > s.ma60
 
-    # 趨勢溢價：收盤 ≥ 年線 × 1.02
-    f_trend = (s.close is not None) and (s.ma240 is not None) and (s.close >= s.ma240 * 1.02)
+    # 量：成交量排行前 N 名視為有量（不再額外踢掉）
+    f_volume = True
 
-    # 族群同步：產業 5 日上漲家數占比 ≥0.6 或 產業指數 > 60MA
-    if (s.industry_up_ratio_5d is not None) or (s.industry_index_price is not None and s.industry_index_ma60 is not None):
-        cond_a = (s.industry_up_ratio_5d is not None) and (s.industry_up_ratio_5d >= 0.6)
-        cond_b = (
-            s.industry_index_price is not None and s.industry_index_ma60 is not None
-            and s.industry_index_price > s.industry_index_ma60
-        )
-        f_group = cond_a or cond_b
+    # 趨勢溢價：若有年線，收盤 ≥ 1.02 * 240MA
+    if s.ma240 is not None and s.ma240 > 0:
+        f_trend = s.close >= 1.02 * s.ma240
     else:
-        # demo 環境下資料不足，暫時預設通過
-        f_group = True
+        f_trend = False
 
-    cond_list = [f_price, f_volume, f_trend, f_group]
-    count = sum(1 for c in cond_list if c)
+    # 族群同步：暫時無產業指數資料，先視為通過
+    f_group = True
+
+    conds = [f_price, f_volume, f_trend, f_group]
+    count = sum(1 for c in conds if c)
     is_firm = (count == 4)
-
     return FirmResult(
         f_price=f_price,
         f_volume=f_volume,
@@ -251,185 +143,106 @@ def check_firm(s: StockSnapshot) -> FirmResult:
 
 
 def calculate_score(s: StockSnapshot, firm: FirmResult) -> ScoreResult:
-    """§8 評分（最大 100 分）"""
-    growth = 0
-    quality = 0
+    # 成長 30 分：依 rev_growth 線性給分，0~30%
+    g_src = max(0.0, min(0.30, s.rev_growth))
+    growth = int(round(g_src / 0.30 * 30))
+
+    # 品質 30 分：ROE + OPM
+    q1 = max(0.0, min(0.30, s.roe)) / 0.30 * 15
+    q2 = max(0.0, min(0.30, s.opm)) / 0.30 * 15
+    quality = int(round(q1 + q2))
+
+    # 動能 25 分：站上 60/240MA + Firm 條件
     momentum = 0
-    valuation = 0
-
-    # Growth 30
-    if not s.is_financial:
-        rev_avg = 0.0
-        cnt = 0
-        for x in (s.revenue_yoy_m1, s.revenue_yoy_m2, s.revenue_yoy_m3):
-            if x is not None:
-                rev_avg += x
-                cnt += 1
-        rev_avg = rev_avg / cnt if cnt > 0 else 0.0
-
-        g1 = max(0.0, min(0.3, rev_avg)) / 0.3 * 15.0
-        eps_g = s.eps_growth_4q or 0.0
-        g2 = max(0.0, min(0.3, eps_g)) / 0.3 * 15.0
-        growth = int(round(g1 + g2))
-    else:
-        eps_g = s.eps_growth_4q or 0.0
-        ni_g = s.net_income_growth_3m or 0.0
-        g1 = max(0.0, min(0.3, eps_g)) / 0.3 * 15.0
-        g2 = max(0.0, min(0.3, ni_g)) / 0.3 * 15.0
-        growth = int(round(g1 + g2))
-
-    # Quality 30
-    if not s.is_financial:
-        roe = s.roe_ttm or 0.0
-        opm = s.opm_ttm or 0.0
-        q1 = max(0.0, min(0.3, roe)) / 0.3 * 15.0
-        q2 = max(0.0, min(0.3, opm)) / 0.3 * 15.0
-        quality = int(round(q1 + q2))
-    else:
-        roe = s.roe_ttm or 0.0
-        q1 = max(0.0, min(0.3, roe)) / 0.3 * 15.0
-        npl = s.npl_ratio if s.npl_ratio is not None else 0.02
-        coverage = s.coverage_ratio if s.coverage_ratio is not None else 0.5
-        raw_q2 = max(0.0, 1.5 - npl * 10.0 + (coverage - 1.0))
-        q2 = max(0.0, min(2.0, raw_q2)) / 2.0 * 15.0
-        quality = int(round(q1 + q2))
-
-    # Momentum 25
-    m = 0
     if s.close > s.ma60:
-        m += 5
-    if s.close > s.ma240:
-        m += 5
-    if s.ma20 > s.ma60:
-        m += 5
-    if s.avg_turnover_20 is not None:
-        today_turnover = s.close * s.volume
-        if today_turnover > s.avg_turnover_20:
-            m += 5
+        momentum += 5
+    if s.ma240 is not None and s.close > s.ma240:
+        momentum += 5
+    if firm.f_volume:
+        momentum += 5
+    if firm.f_trend:
+        momentum += 5
     if firm.f_group:
-        m += 5
-    momentum = m
+        momentum += 5
 
-    # Valuation 15（暫給 10 分，估值細節由本機 Pmoney 處理）
-    valuation = 10
+    valuation = 10  # 估值暫給固定 10 分
 
-    total = growth + quality + momentum + valuation
-    total = int(max(0, min(100, total)))
-    return ScoreResult(total=total, growth=growth, quality=quality, momentum=momentum, valuation=valuation)
-
-
-def check_e_candidate(s: StockSnapshot) -> bool:
-    """§4 E 層候選條件"""
-    if s.rs60 < 75:
-        return False
-    if s.inst_net_buy_20 is None or s.inst_net_buy_20 < 0:
-        return False
-    if s.industry_rank_by_size is None or s.industry_rank_by_size > 3:
-        return False
-    if s.last_quarter_growth is None or s.last_quarter_growth < 0.10:
-        return False
-    return True
+    total = max(0, min(100, growth + quality + momentum + valuation))
+    return ScoreResult(
+        total=int(total),
+        growth=growth,
+        quality=quality,
+        momentum=momentum,
+        valuation=valuation,
+    )
 
 
 def classify_stock(
     s: StockSnapshot,
-    universe: UniverseResult,
+    uni: UniverseResult,
     firm: FirmResult,
-    score: ScoreResult
+    score: ScoreResult,
 ) -> ClassificationResult:
-    """§6 分層邏輯：A / B / C / D / X"""
-    extra: Dict[str, Any] = {}
-
-    if not universe.passed:
+    if not uni.passed:
         return ClassificationResult(
             symbol=s.symbol,
             name=s.name,
-            layer=Layer.ELIMINATED,
-            is_e_candidate=False,
-            universe=universe,
+            layer=Layer.X,
+            universe=uni,
             firm=firm,
             score=score,
-            extra_info={"reason": "Universe not passed"},
+            is_e_candidate=False,
+            extra_reason="Universe not passed",
         )
 
-    # A 層
+    # A 層：Firm 四面齊 + Score ≥ 70
     if firm.is_firm and score.total >= 70:
         layer = Layer.A
-        extra["reason"] = "Firm(4/4) 且 Score ≥ 70"
+        reason = "Firm(4/4) + Score>=70"
+    # B 層：Firm 缺一 或 Score 60–69
+    elif firm.count == 3 or (60 <= score.total <= 69):
+        layer = Layer.B
+        reason = "Firm缺一或Score在60–69"
+    # C 層：至少站上 60MA + 基本面 OK
+    elif firm.f_price and uni.checks.get("roe", False) and (s.opm >= 0.03):
+        layer = Layer.C
+        reason = "站上均線 + 基本面佳"
     else:
-        # B 層
-        if firm.count == 3 or (60 <= score.total <= 69):
-            layer = Layer.B
-            extra["reason"] = "Firm 缺一 或 Score 60–69"
-        else:
-            # C 層
-            rev_avg = 0.0
-            cnt = 0
-            for x in (s.revenue_yoy_m1, s.revenue_yoy_m2, s.revenue_yoy_m3):
-                if x is not None:
-                    rev_avg += x
-                    cnt += 1
-            rev_avg = rev_avg / cnt if cnt > 0 else 0.0
-            growth_relaxed = (rev_avg >= 0.0) or (s.revenue_yoy_m1 is not None and s.revenue_yoy_m1 >= 0.05)
+        layer = Layer.D
+        reason = "Universe 通過但動能較弱"
 
-            if (
-                firm.count >= 3
-                and firm.f_price
-                and (s.roe_ttm is not None and s.roe_ttm > 0.10)
-                and (s.opm_ttm is not None and s.opm_ttm >= 0.03)
-                and growth_relaxed
-            ):
-                layer = Layer.C
-                extra["reason"] = "Firm≥3 + 基本面佳（放寬成長）"
-            else:
-                # D 層
-                cond_bottom = 0
-                if s.roe_ttm is not None and s.roe_ttm >= 0.08:
-                    cond_bottom += 1
-                if s.opm_ttm is not None and s.opm_ttm >= 0.02:
-                    cond_bottom += 1
-
-                rev_avg = 0.0
-                cnt = 0
-                for x in (s.revenue_yoy_m1, s.revenue_yoy_m2, s.revenue_yoy_m3):
-                    if x is not None:
-                        rev_avg += x
-                        cnt += 1
-                rev_avg = rev_avg / cnt if cnt > 0 else 0.0
-                if rev_avg >= -0.03:
-                    cond_bottom += 1
-
-                if firm.count >= 2 and cond_bottom >= 2:
-                    layer = Layer.D
-                    extra["reason"] = "Firm≥2 + 底線三選二"
-                else:
-                    layer = Layer.ELIMINATED
-                    extra["reason"] = "不符 A/B/C/D 任一層級"
-
-    is_e = check_e_candidate(s)
-
+    # E 候選：暫用簡單條件
+    is_e = (score.total >= 75)
     return ClassificationResult(
         symbol=s.symbol,
         name=s.name,
         layer=layer,
-        is_e_candidate=is_e,
-        universe=universe,
+        universe=uni,
         firm=firm,
         score=score,
-        extra_info=extra,
+        is_e_candidate=is_e,
+        extra_reason=reason,
     )
 
 
 # ============================================================
-# 2. 成交量掃描爬蟲 (TWSE + TPEX + Yahoo)
+# 3. 成交量排行爬蟲 (TWSE + TPEx + Yahoo 備援)
 # ============================================================
 
 UA = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
     "Accept": "application/json, text/plain, */*",
 }
-TWSE_REF = {"Referer": "https://www.twse.com.tw/zh/trading/historical/mi-index.html"}
-TPEX_REF = {"Referer": "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st41.php"}
+TWSE_REF = {
+    "Referer": "https://www.twse.com.tw/zh/trading/historical/mi-index.html"
+}
+TPEX_REF = {
+    "Referer": "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st41.php"
+}
 
 
 def _fmt_int(x):
@@ -444,12 +257,8 @@ def _fmt_int(x):
 
 def _smart_trade_date() -> dt.date:
     """
-    參照 VBA GetTop100_JSON_Final 的日期邏輯：
-    - 週六抓週五
-    - 週日抓週五
-    - 週一盤中 (<15:00) 抓上週五
-    - 其他平日盤中 (<15:00) 抓前一個交易日
-    - 其餘時間抓當天
+    週六→週五；週日→週五；週一盤前/盤中→上週五；
+    其他平日盤中→昨天；收盤後→當天。
     """
     now = dt.datetime.now()
     if ZoneInfo:
@@ -461,32 +270,21 @@ def _smart_trade_date() -> dt.date:
     d = now.date()
     wd = d.weekday()  # Monday=0 ... Sunday=6
 
-    # 週六 -> 週五
-    if wd == 5:
-        d = d - dt.timedelta(days=1)
-    # 週日 -> 週五
-    elif wd == 6:
-        d = d - dt.timedelta(days=2)
-    # 週一盤中 -> 上週五
-    elif wd == 0 and now.hour < 15:
-        d = d - dt.timedelta(days=3)
-    # 其他平日盤中 -> 昨天
-    elif now.hour < 15 and wd <= 4:
-        d = d - dt.timedelta(days=1)
+    if wd == 5:           # Sat
+        d -= dt.timedelta(days=1)
+    elif wd == 6:         # Sun
+        d -= dt.timedelta(days=2)
+    elif wd == 0 and now.hour < 15:   # Mon before close
+        d -= dt.timedelta(days=3)
+    elif now.hour < 15 and wd <= 4:   # Tue–Fri before close
+        d -= dt.timedelta(days=1)
 
     return d
 
 
 def fetch_twse_json(yyyymmdd: str):
-    """
-    上市：exchangeReport/MI_INDEX?response=json&type=ALLBUT0999
-    """
     url = "https://www.twse.com.tw/exchangeReport/MI_INDEX"
-    params = {
-        "response": "json",
-        "date": yyyymmdd,
-        "type": "ALLBUT0999",
-    }
+    params = {"response": "json", "date": yyyymmdd, "type": "ALLBUT0999"}
     s = requests.Session()
     s.headers.update(UA)
     s.headers.update(TWSE_REF)
@@ -499,20 +297,14 @@ def fetch_twse_json(yyyymmdd: str):
     return None
 
 
-def parse_twse_top_by_volume(j: dict):
-    """
-    解析 TWSE JSON：
-    - 先找含「證券代號 / 證券名稱 / 成交股數」的表
-    - 回傳 symbol(.TW) / name / volume(股數)
-    """
+def parse_twse_top_by_volume(j: dict) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-
     if not isinstance(j, dict):
         return rows
 
-    # 新版 rwd 格式：tables[]
+    # 優先解析新版 tables
     tables = j.get("tables")
-    if isinstance(tables, list) and tables:
+    if isinstance(tables, list):
         for t in tables:
             fields = t.get("fields", [])
             data = t.get("data", [])
@@ -538,22 +330,19 @@ def parse_twse_top_by_volume(j: dict):
         if rows:
             return rows
 
-    # 舊版 exchangeReport 格式：dataX / fieldsX
+    # 退而求其次解析舊版 dataX/fieldsX
     for key, value in j.items():
         if not (isinstance(key, str) and key.startswith("data")):
             continue
         if not isinstance(value, list):
             continue
-
         idx = key[4:]
         fields = j.get(f"fields{idx}", [])
         if "證券代號" not in fields or "成交股數" not in fields:
             continue
-
         id_i = fields.index("證券代號")
         name_i = fields.index("證券名稱")
         vol_i = fields.index("成交股數")
-
         for row in value:
             if not isinstance(row, list):
                 continue
@@ -573,41 +362,47 @@ def parse_twse_top_by_volume(j: dict):
                     "market": "上市",
                 }
             )
-
     return rows
 
 
 def fetch_tpex_json(roc_date: str):
     """
-    上櫃：stk_quote_result.php?l=zh-tw&o=json&d=ROC_DATE
+    這裡直接沿用你原本 VBA / Gemini 成功版本的參數：
+    ?l=zh-tw&d=民國日期&s=0,asc,0
+    並加上一個 www 備援網址。
     """
-    url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php"
-    params = {
-        "l": "zh-tw",
-        "o": "json",
-        "d": roc_date,
-    }
+    urls = [
+        (
+            "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php",
+            {"l": "zh-tw", "d": roc_date, "s": "0,asc,0"},
+        ),
+        (
+            "https://www.tpex.org.tw/www/stock/aftertrading/daily_close_quotes/stk_quote_result.php",
+            {"l": "zh-tw", "d": roc_date, "s": "0,asc,0"},
+        ),
+    ]
+
     s = requests.Session()
     s.headers.update(UA)
     s.headers.update(TPEX_REF)
-    try:
-        r = s.get(url, params=params, timeout=15)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        return None
+
+    for url, params in urls:
+        try:
+            r = s.get(url, params=params, timeout=10)
+            if r.status_code == 200:
+                j = r.json()
+                if isinstance(j, dict) and j.get("aaData"):
+                    return j
+        except Exception:
+            continue
+
     return None
 
 
-def parse_tpex_top_by_volume(j: dict):
-    """
-    解析 TPEx JSON (aaData)：
-    - 0=代號, 1=名稱, 8=成交股數
-    """
+def parse_tpex_top_by_volume(j: dict) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     if not isinstance(j, dict):
         return rows
-
     data = j.get("aaData", [])
     for row in data:
         try:
@@ -630,12 +425,12 @@ def parse_tpex_top_by_volume(j: dict):
     return rows
 
 
-def yahoo_fallback(topn: int):
-    """
-    Yahoo Finance 熱門股備援（仍是線上資料）
-    """
+def yahoo_fallback(topn: int) -> List[Dict[str, Any]]:
     try:
-        url = f"https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?count={topn*2}&scrIds=most_actives_tw"
+        url = (
+            "https://query1.finance.yahoo.com/v1/finance/screener/predefined/"
+            f"saved?count={topn*2}&scrIds=most_actives_tw"
+        )
         r = requests.get(url, headers=UA, timeout=10)
         j = r.json()
         quotes = j["finance"]["result"][0]["quotes"]
@@ -662,12 +457,6 @@ def yahoo_fallback(topn: int):
 
 @st.cache_data(ttl=1800)
 def get_market_scan_list(limit: int):
-    """
-    取得市場掃描清單：
-    1. 優先 TWSE + TPEx（照 VBA 日期與 URL）
-    2. 官方都掛掉 → 改走 Yahoo 熱門股
-    3. 連 Yahoo 都掛掉 → 回傳空，讓 UI 直接報錯
-    """
     d = _smart_trade_date()
     yyyymmdd = d.strftime("%Y%m%d")
     roc_date = f"{d.year - 1911}/{d.month:02d}/{d.day:02d}"
@@ -688,30 +477,32 @@ def get_market_scan_list(limit: int):
         all_data.sort(key=lambda x: x["volume"], reverse=True)
         return all_data[: limit * 2], d.strftime("%Y-%m-%d")
 
-    # 官方都掛掉 -> 改走 Yahoo（仍為線上資料）
+    # 官方都掛掉 → Yahoo 熱門備援
     yahoo_rows = yahoo_fallback(limit)
     if yahoo_rows:
         return yahoo_rows, "Yahoo即時(備援)"
 
-    # 連 Yahoo 都掛掉 -> 回傳空
     return [], d.strftime("%Y-%m-%d")
 
 
 # ============================================================
-# 3. yfinance → StockSnapshot 轉換
+# 4. yfinance → StockSnapshot
 # ============================================================
 
-def build_snapshot_from_yfinance(
-    symbol: str, name: str, info: Dict[str, Any], history: pd.DataFrame
+def build_snapshot(
+    symbol: str,
+    name: str,
+    info: Dict[str, Any],
+    history: pd.DataFrame,
 ) -> Optional[StockSnapshot]:
-    """
-    將 yfinance 的 info + history 轉成 StockSnapshot。
-    """
-    if history is None or history.empty or len(history) < 240:
+    if history is None or history.empty:
+        return None
+    # 放寬成至少 60 根 K 就算
+    if len(history) < 60:
         return None
 
     hist = history.dropna(subset=["Close", "Volume"])
-    if hist.empty or len(hist) < 240:
+    if hist.empty:
         return None
 
     last = hist.iloc[-1]
@@ -720,126 +511,75 @@ def build_snapshot_from_yfinance(
 
     ma20 = float(hist["Close"].rolling(20).mean().iloc[-1])
     ma60 = float(hist["Close"].rolling(60).mean().iloc[-1])
-    ma240 = float(hist["Close"].rolling(240).mean().iloc[-1])
-
-    # 近 20 日平均成交金額
-    turnover_20 = float((hist["Close"] * hist["Volume"]).tail(20).mean())
-
-    # 近 20 日換手率
-    shares_out = info.get("sharesOutstanding") or None
-    if isinstance(shares_out, (int, float)) and shares_out > 0:
-        avg_vol20 = float(hist["Volume"].tail(20).mean())
-        turnover_ratio_20 = avg_vol20 / shares_out
+    if len(hist) >= 240:
+        ma240 = float(hist["Close"].rolling(240).mean().iloc[-1])
     else:
-        turnover_ratio_20 = None
+        ma240 = None
 
     market_cap = float(info.get("marketCap") or 0.0)
+    roe = float(info.get("returnOnEquity") or 0.0)
+    opm = float(info.get("operatingMargins") or 0.0)
+    rev_growth = float(info.get("revenueGrowth") or 0.0)
 
-    roe_ttm = info.get("returnOnEquity")
-    opm_ttm = info.get("operatingMargins")
-
-    # 負債比
-    debt_ratio = None
-    total_debt = info.get("totalDebt")
-    total_assets = info.get("totalAssets")
-    total_equity = info.get("totalStockholderEquity")
     debt_to_equity = info.get("debtToEquity")
-
-    if isinstance(total_debt, (int, float)) and isinstance(total_assets, (int, float)) and total_assets > 0:
-        debt_ratio = float(total_debt) / float(total_assets)
-    elif isinstance(total_debt, (int, float)) and isinstance(total_equity, (int, float)) and (total_debt + total_equity) > 0:
-        debt_ratio = float(total_debt) / float(total_debt + total_equity)
-    elif isinstance(debt_to_equity, (int, float)):
+    if isinstance(debt_to_equity, (int, float)):
         de = float(debt_to_equity) / 100.0
         debt_ratio = de / (1.0 + de)
-
-    rev_growth = info.get("revenueGrowth")
-    if isinstance(rev_growth, (int, float)):
-        revenue_yoy_m1 = revenue_yoy_m2 = revenue_yoy_m3 = float(rev_growth)
     else:
-        revenue_yoy_m1 = revenue_yoy_m2 = revenue_yoy_m3 = None
+        debt_ratio = 0.0
 
-    eps_growth = info.get("earningsGrowth")
-    ni_growth = info.get("earningsQuarterlyGrowth")
-    eps_growth_4q = float(eps_growth) if isinstance(eps_growth, (int, float)) else 0.0
-    net_income_growth_3m = float(ni_growth) if isinstance(ni_growth, (int, float)) else 0.0
-
-    industry = info.get("industry") or info.get("sector") or ""
-    industry_lower = industry.lower() if isinstance(industry, str) else ""
-
-    # 金融股判斷 (簡易)
-    is_financial = any(
-        key in industry_lower
-        for key in ["bank", "insurance", "financial", "證券", "投信", "投顧", "銀行", "保險"]
-    )
-    # 循環股判斷 (簡易)
-    is_cyclical = any(
-        key in industry_lower
-        for key in ["steel", "metal", "shipping", "ship", "plastic", "petrochemical", "panel", "display", "dram", "memory", "鋼", "航運", "塑膠", "面板"]
+    industry = (info.get("industry") or info.get("sector") or "").lower()
+    is_fin = any(
+        k in industry for k in ["bank", "insurance", "financial", "證券", "銀行", "保險"]
     )
 
-    snapshot = StockSnapshot(
+    return StockSnapshot(
         symbol=symbol,
         name=name,
-        is_financial=is_financial,
-        is_cyclical=is_cyclical,
         close=close,
         volume=volume,
         ma20=ma20,
         ma60=ma60,
         ma240=ma240,
-        avg_turnover_20=turnover_20,
-        turnover_ratio_20=turnover_ratio_20,
         market_cap=market_cap,
-        roe_ttm=float(roe_ttm) if isinstance(roe_ttm, (int, float)) else 0.0,
-        opm_ttm=float(opm_ttm) if isinstance(opm_ttm, (int, float)) else 0.0,
-        debt_ratio=float(debt_ratio) if isinstance(debt_ratio, (int, float)) else 0.0,
-        revenue_yoy_m1=revenue_yoy_m1,
-        revenue_yoy_m2=revenue_yoy_m2,
-        revenue_yoy_m3=revenue_yoy_m3,
-        eps_growth_4q=eps_growth_4q,
-        net_income_growth_3m=net_income_growth_3m,
-        npl_ratio=None,
-        coverage_ratio=None,
-        rs60=50.0,
-        industry=industry,
-        industry_index_price=None,
-        industry_index_ma60=None,
-        industry_up_ratio_5d=None,
-        inst_net_buy_20=None,
-        industry_rank_by_size=None,
-        last_quarter_growth=None,
+        roe=roe,
+        opm=opm,
+        rev_growth=rev_growth,
+        debt_ratio=debt_ratio,
+        is_financial=is_fin,
     )
-    return snapshot
 
 
 # ============================================================
-# 4. Streamlit UI
+# 5. Streamlit UI
 # ============================================================
 
-st.set_page_config(page_title="v7.9.8 選股雷達", page_icon="🎯", layout="wide")
+st.set_page_config(
+    page_title="v7.9.8 選股雷達",
+    page_icon="🎯",
+    layout="wide",
+)
 
 st.title("🎯 v7.9.8 投資規則 - 嚴格篩選雷達（單檔整合版）")
 st.markdown(
     """
-**核心精神：** 以 v7.9.8 規則為主軸，整合成交量掃描與完整 Universe / Firm / 分層邏輯，對熱門標的進行初篩。  
-- **§3.1 / §3.1-F 基本面：** ROE>10%、OPM≥5%、營收成長、負債比、(金融股: NPL / Coverage / EPS/淨利成長)  
-- **§3.5 流動性：** 20 日均額 ≥ 5,000 萬、20 日換手率 ≥ 0.3%  
-- **§3.2 Firm：** 站上季線與年線、量能放大、趨勢溢價、族群同步  
-- **§6 分層：** A / B / C / D 分級，並標示 E 層候選旗標  
-"""
+    **核心精神：** 以 v7.9.8 規則為主軸，整合成交量掃描與 Universe / Firm / 分層邏輯，對熱門標的進行初篩。  
+    - §3.1 / §3.1-F 基本面：ROE>10%、OPM≥5%、營收成長、負債比  
+    - §3.5 流動性：由「成交量排行前 N 名」保證，程式不再額外踢掉低量  
+    - §3.2 Firm：站上季線與年線、趨勢溢價、族群同步（簡化版）  
+    """
 )
 
 st.sidebar.header("⚙️ 參數設定")
 scan_limit = st.sidebar.slider("掃描成交量前 N 大", 30, 200, 100, 10)
 max_price = st.sidebar.number_input("股價上限 (§3.1 非金融)", value=80.0, step=5.0)
-min_vol = st.sidebar.number_input("當日成交量下限 (張)", value=1000)
 
 st.sidebar.markdown("---")
-st.sidebar.info("💡 全揭露模式：所有掃描過的股票都會列出，並顯示 Universe / Firm / 分層原因，方便檢視死在哪一關。")
+st.sidebar.info(
+    "💡 全揭露模式：所有掃描過的股票都會列出，並顯示 Universe / Firm / 分層原因，方便檢視死在哪一關。"
+)
 
 if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
-    # 1. 取得成交量排行清單
     with st.spinner("正在抓取上市＋上櫃成交量排行..."):
         target_list, data_date = get_market_scan_list(scan_limit)
 
@@ -853,6 +593,8 @@ if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
     progress_bar = st.progress(0)
     status_text = st.empty()
 
+    # 統計用
+    empty_hist = short_hist = ok_snap = 0
     scan_targets = target_list[:scan_limit]
 
     for i, meta in enumerate(scan_targets):
@@ -860,57 +602,56 @@ if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
         name = meta["name"]
 
         progress_bar.progress((i + 1) / len(scan_targets))
-        status_text.text(f"正在分析 [{i+1}/{len(scan_targets)}]: {name} ({symbol}) ...")
+        status_text.text(
+            f"正在分析 [{i+1}/{len(scan_targets)}]: {name} ({symbol}) ..."
+        )
 
         try:
             ticker = yf.Ticker(symbol)
             hist = ticker.history(period="2y")
+
             if hist is None or hist.empty:
+                empty_hist += 1
                 continue
 
             last = hist.iloc[-1]
             vol_lots_today = float(last["Volume"]) / 1000.0
-            if vol_lots_today < float(min_vol):
-                # 當日量不足，可直接跳過
-                continue
 
             info = ticker.info or {}
-            snapshot = build_snapshot_from_yfinance(symbol, name, info, hist)
-            if snapshot is None:
+            snap = build_snapshot(symbol, name, info, hist)
+            if snap is None:
+                short_hist += 1
                 continue
 
-            price_cap = max_price if not snapshot.is_financial else PRICE_CAP_DEFAULT
+            ok_snap += 1
 
-            universe = check_universe(snapshot, price_cap=price_cap)
-            firm = check_firm(snapshot)
-            score = calculate_score(snapshot, firm)
-            cls = classify_stock(snapshot, universe, firm)
-
-            grade = cls.layer.value
-            price = round(snapshot.close, 2)
-
-            basic_ok = universe.checks.get("roe", False) and universe.checks.get("opm", False)
-            tech_ok = firm.f_price and firm.f_volume and firm.f_trend
-            price_ok = universe.checks.get("price", False)
-
-            roe_percent = f"{snapshot.roe_ttm * 100:.1f}%" if snapshot.roe_ttm is not None else "-"
-            opm_percent = f"{snapshot.opm_ttm * 100:.1f}%" if snapshot.opm_ttm is not None else "-"
+            # Universe / Firm / Score / 分層
+            uni = check_universe(snap, price_cap=max_price)
+            firm = check_firm(snap)
+            score = calculate_score(snap, firm)
+            cls = classify_stock(snap, uni, firm, score)
 
             results.append(
                 {
-                    "代號": symbol,
-                    "名稱": name,
-                    "評級": grade,
+                    "代號": snap.symbol,
+                    "名稱": snap.name,
+                    "評級": cls.layer.value,
                     "E候選": "⭐" if cls.is_e_candidate else "",
-                    "收盤價": price,
+                    "收盤價": round(snap.close, 2),
                     "成交量": int(vol_lots_today),
-                    "基本面": "✅" if basic_ok else "❌",
-                    "技術面": "✅" if tech_ok else "❌",
-                    "價格符合": "✅" if price_ok else "❌",
-                    "ROE": roe_percent,
-                    "OPM": opm_percent,
+                    "基本面": "✅"
+                    if (uni.checks.get("roe") and uni.checks.get("opm"))
+                    else "❌",
+                    "技術面": "✅"
+                    if (firm.f_price and firm.f_trend)
+                    else "❌",
+                    "價格符合": "✅"
+                    if uni.checks.get("price")
+                    else "❌",
+                    "ROE": f"{snap.roe*100:.1f}%",
+                    "OPM": f"{snap.opm*100:.1f}%",
                     "Score": score.total,
-                    "LayerReason": cls.extra_info.get("reason", universe.reason),
+                    "LayerReason": cls.extra_reason,
                 }
             )
         except Exception:
@@ -919,12 +660,20 @@ if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
     progress_bar.empty()
     status_text.empty()
 
+    st.warning(
+        f"掃描統計：history 空 {empty_hist} 檔、"
+        f"歷史不足(<60根K) {short_hist} 檔、"
+        f"成功評分 {ok_snap} 檔"
+    )
+
     if results:
         df = pd.DataFrame(results)
-
         grade_order = {"A": 0, "B": 1, "C": 2, "D": 3, "X": 4}
         df["grade_sort"] = df["評級"].map(grade_order).fillna(4)
-        df = df.sort_values(by=["grade_sort", "Score", "成交量"], ascending=[True, False, False])
+        df = df.sort_values(
+            by=["grade_sort", "Score", "成交量"],
+            ascending=[True, False, False],
+        )
 
         a_count = int((df["評級"] == "A").sum())
         b_count = int((df["評級"] == "B").sum())
@@ -952,18 +701,18 @@ if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
             use_container_width=True,
         )
 
-        # 建議操作區（示意，真正下單仍以你本機 v7.9.8 流程為準）
-        st.markdown("### 📋 v7.9.8 建議操作（僅供參考）")
+        st.markdown("### 📋 v7.9.8 建議操作（示意）")
         valid_stocks = df[df["評級"].isin(["A", "B"])]
-
         if not valid_stocks.empty:
             for _, row in valid_stocks.iterrows():
-                action = "市價買進 (整張)" if row["評級"] == "A" else "半單位買進"
+                action = "整張買進" if row["評級"] == "A" else "半單位買進"
                 st.success(
-                    f"**[{row['評級']}級] {row['名稱']} ({row['代號']})** | 收盤: {row['收盤價']} | ROE: {row['ROE']} | Score: {row['Score']}\n\n"
-                    f"👉 建議：隔日開盤 {action}，技術停損暫以 -12% ＋ SDR 由本機 Pmoney 引擎執行。"
+                    f"**[{row['評級']}級] {row['名稱']} ({row['代號']})** | "
+                    f"收盤 {row['收盤價']} | ROE {row['ROE']} | "
+                    f"Score {row['Score']} → 建議：隔日開盤 {action}"
+                    "（實際下單仍依主程式規則）。"
                 )
         else:
             st.warning("今日無 A/B 級標的。")
     else:
-        st.error("掃描結果為空。")
+        st.error("掃描結果為空，請先看上方統計訊息判斷是資料不足還是規則太嚴。")
