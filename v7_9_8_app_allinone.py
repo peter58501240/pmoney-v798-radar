@@ -16,16 +16,16 @@ except ImportError:
     ZoneInfo = None
 
 
-# ============================================================
-# 1. 基本型別與評分結構
-# ============================================================
+# =========================
+# 一、v7.9.8 規則核心資料結構
+# =========================
 
 class Layer(str, Enum):
     A = "A"
     B = "B"
     C = "C"
     D = "D"
-    X = "X"   # 淘汰 / 不符合
+    X = "X"  # 淘汰 / 資料不足
 
 
 @dataclass
@@ -83,26 +83,32 @@ class StockSnapshot:
     is_financial: bool
 
 
-# ============================================================
-# 2. 規則邏輯 (v7.9.8 精簡實作)
-# ============================================================
+MIN_MKT_CAP = 1_000_000_000  # §3.1 市值下限
 
-MIN_MKT_CAP = 1_000_000_000   # 市值 ≥ 10 億
 
+# =========================
+# 二、Universe / Firm / Score
+# =========================
 
 def check_universe(s: StockSnapshot, price_cap: float) -> UniverseResult:
+    """§3.1 / §3.1-F Universe 篩選"""
     checks: Dict[str, bool] = {}
 
-    # 非金融才套股價上限
+    # 價格上限：非金融才管；金融股不限價（跟你原始條文一致）
     if s.is_financial:
         checks["price"] = True
     else:
         checks["price"] = s.close <= price_cap
 
+    # 市值
     checks["mkt_cap"] = s.market_cap >= MIN_MKT_CAP
+    # ROE
     checks["roe"] = s.roe > 0.10
+    # OPM
     checks["opm"] = s.opm >= 0.05
+    # 營收成長
     checks["rev"] = s.rev_growth >= 0.05
+    # 負債比
     checks["debt"] = s.debt_ratio < 0.60 if s.debt_ratio >= 0 else True
 
     passed = all(checks.values())
@@ -111,22 +117,24 @@ def check_universe(s: StockSnapshot, price_cap: float) -> UniverseResult:
 
 
 def check_firm(s: StockSnapshot) -> FirmResult:
-    # 價格：>60MA & 若有年線則也要 >240MA
+    """§3.2 Firm 動能就緒（簡化版）"""
+
+    # 價格：站上季線＋年線；如果資料不足年線，只看季線
     if s.ma240 is not None and s.ma240 > 0:
         f_price = (s.close > s.ma60) and (s.close > s.ma240)
     else:
         f_price = s.close > s.ma60
 
-    # 量：成交量排行前 N 名視為有量（不再額外踢掉）
+    # 量能條件：這裡因為前面已經是成交量前 N 大，所以不再硬性設 1.5 倍爆量
     f_volume = True
 
-    # 趨勢溢價：若有年線，收盤 ≥ 1.02 * 240MA
+    # 趨勢溢價：> 年線 * 1.02，有年線才算
     if s.ma240 is not None and s.ma240 > 0:
         f_trend = s.close >= 1.02 * s.ma240
     else:
         f_trend = False
 
-    # 族群同步：暫時無產業指數資料，先視為通過
+    # 族群同步：目前資料源沒有產業指數，先一律視為通過
     f_group = True
 
     conds = [f_price, f_volume, f_trend, f_group]
@@ -143,16 +151,18 @@ def check_firm(s: StockSnapshot) -> FirmResult:
 
 
 def calculate_score(s: StockSnapshot, firm: FirmResult) -> ScoreResult:
-    # 成長 30 分：依 rev_growth 線性給分，0~30%
+    """§8 簡化版評分：100 分制"""
+
+    # 成長 (0–30)：用營收成長近似
     g_src = max(0.0, min(0.30, s.rev_growth))
     growth = int(round(g_src / 0.30 * 30))
 
-    # 品質 30 分：ROE + OPM
+    # 品質 (0–30)：ROE + OPM
     q1 = max(0.0, min(0.30, s.roe)) / 0.30 * 15
     q2 = max(0.0, min(0.30, s.opm)) / 0.30 * 15
     quality = int(round(q1 + q2))
 
-    # 動能 25 分：站上 60/240MA + Firm 條件
+    # 動能 (0–25)
     momentum = 0
     if s.close > s.ma60:
         momentum += 5
@@ -165,7 +175,8 @@ def calculate_score(s: StockSnapshot, firm: FirmResult) -> ScoreResult:
     if firm.f_group:
         momentum += 5
 
-    valuation = 10  # 估值暫給固定 10 分
+    # 估值 (固定 10 分，先不在這版裡細拆)
+    valuation = 10
 
     total = max(0, min(100, growth + quality + momentum + valuation))
     return ScoreResult(
@@ -183,6 +194,8 @@ def classify_stock(
     firm: FirmResult,
     score: ScoreResult,
 ) -> ClassificationResult:
+    """§6 分層：A/B/C/D/X"""
+
     if not uni.passed:
         return ClassificationResult(
             symbol=s.symbol,
@@ -195,15 +208,12 @@ def classify_stock(
             extra_reason="Universe not passed",
         )
 
-    # A 層：Firm 四面齊 + Score ≥ 70
     if firm.is_firm and score.total >= 70:
         layer = Layer.A
         reason = "Firm(4/4) + Score>=70"
-    # B 層：Firm 缺一 或 Score 60–69
     elif firm.count == 3 or (60 <= score.total <= 69):
         layer = Layer.B
         reason = "Firm缺一或Score在60–69"
-    # C 層：至少站上 60MA + 基本面 OK
     elif firm.f_price and uni.checks.get("roe", False) and (s.opm >= 0.03):
         layer = Layer.C
         reason = "站上均線 + 基本面佳"
@@ -211,8 +221,9 @@ def classify_stock(
         layer = Layer.D
         reason = "Universe 通過但動能較弱"
 
-    # E 候選：暫用簡單條件
+    # E 候選：這版簡化為「高分標的」
     is_e = (score.total >= 75)
+
     return ClassificationResult(
         symbol=s.symbol,
         name=s.name,
@@ -225,9 +236,9 @@ def classify_stock(
     )
 
 
-# ============================================================
-# 3. 成交量排行爬蟲 (TWSE + TPEx + Yahoo 備援)
-# ============================================================
+# =========================
+# 三、抓 TWSE + TPEx 成交量排行
+# =========================
 
 UA = {
     "User-Agent": (
@@ -241,7 +252,7 @@ TWSE_REF = {
     "Referer": "https://www.twse.com.tw/zh/trading/historical/mi-index.html"
 }
 TPEX_REF = {
-    "Referer": "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st41.php"
+    "Referer": "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php"
 }
 
 
@@ -256,10 +267,7 @@ def _fmt_int(x):
 
 
 def _smart_trade_date() -> dt.date:
-    """
-    週六→週五；週日→週五；週一盤前/盤中→上週五；
-    其他平日盤中→昨天；收盤後→當天。
-    """
+    """決定抓哪一天的盤後資料：盤前抓前一天、週一早上抓上週五"""
     now = dt.datetime.now()
     if ZoneInfo:
         try:
@@ -268,15 +276,15 @@ def _smart_trade_date() -> dt.date:
             pass
 
     d = now.date()
-    wd = d.weekday()  # Monday=0 ... Sunday=6
+    wd = d.weekday()
 
-    if wd == 5:           # Sat
+    if wd == 5:      # Sat -> Fri
         d -= dt.timedelta(days=1)
-    elif wd == 6:         # Sun
+    elif wd == 6:    # Sun -> Fri
         d -= dt.timedelta(days=2)
-    elif wd == 0 and now.hour < 15:   # Mon before close
+    elif wd == 0 and now.hour < 15:  # Mon 盤前 -> Fri
         d -= dt.timedelta(days=3)
-    elif now.hour < 15 and wd <= 4:   # Tue–Fri before close
+    elif now.hour < 15 and wd <= 4:  # 平日盤前 -> 前一日
         d -= dt.timedelta(days=1)
 
     return d
@@ -298,11 +306,12 @@ def fetch_twse_json(yyyymmdd: str):
 
 
 def parse_twse_top_by_volume(j: dict) -> List[Dict[str, Any]]:
+    """解析上市 JSON，回傳 [{symbol, name, volume, market}]"""
     rows: List[Dict[str, Any]] = []
     if not isinstance(j, dict):
         return rows
 
-    # 優先解析新版 tables
+    # 新版格式：tables[]
     tables = j.get("tables")
     if isinstance(tables, list):
         for t in tables:
@@ -313,11 +322,14 @@ def parse_twse_top_by_volume(j: dict) -> List[Dict[str, Any]]:
                 name_i = fields.index("證券名稱")
                 vol_i = fields.index("成交股數")
                 for row in data:
+                    if not isinstance(row, list):
+                        continue
                     sid = str(row[id_i]).strip()
-                    if len(sid) != 4 or not sid.isdigit():
+                    # 這裡改成「4–6 碼純數字」，跟你 VBA 一樣
+                    if (not sid.isdigit()) or not (4 <= len(sid) <= 6):
                         continue
                     vol = _fmt_int(row[vol_i])
-                    if vol is None:
+                    if vol is None or vol <= 0:
                         continue
                     rows.append(
                         {
@@ -330,7 +342,7 @@ def parse_twse_top_by_volume(j: dict) -> List[Dict[str, Any]]:
         if rows:
             return rows
 
-    # 退而求其次解析舊版 dataX/fieldsX
+    # 舊版 fallback：data9 / fields9 ...
     for key, value in j.items():
         if not (isinstance(key, str) and key.startswith("data")):
             continue
@@ -349,10 +361,10 @@ def parse_twse_top_by_volume(j: dict) -> List[Dict[str, Any]]:
             if len(row) <= max(id_i, name_i, vol_i):
                 continue
             sid = str(row[id_i]).strip()
-            if len(sid) != 4 or not sid.isdigit():
+            if (not sid.isdigit()) or not (4 <= len(sid) <= 6):
                 continue
             vol = _fmt_int(row[vol_i])
-            if vol is None:
+            if vol is None or vol <= 0:
                 continue
             rows.append(
                 {
@@ -366,40 +378,34 @@ def parse_twse_top_by_volume(j: dict) -> List[Dict[str, Any]]:
 
 
 def fetch_tpex_json(roc_date: str):
-    """
-    這裡直接沿用你原本 VBA / Gemini 成功版本的參數：
-    ?l=zh-tw&d=民國日期&s=0,asc,0
-    並加上一個 www 備援網址。
-    """
+    """抓上櫃 JSON，參數完全比照你 Excel VBA 寫法"""
     urls = [
         (
             "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php",
-            {"l": "zh-tw", "d": roc_date, "s": "0,asc,0"},
+            {"l": "zh-tw", "o": "json", "d": roc_date},
         ),
         (
             "https://www.tpex.org.tw/www/stock/aftertrading/daily_close_quotes/stk_quote_result.php",
-            {"l": "zh-tw", "d": roc_date, "s": "0,asc,0"},
+            {"l": "zh-tw", "o": "json", "d": roc_date},
         ),
     ]
-
     s = requests.Session()
     s.headers.update(UA)
     s.headers.update(TPEX_REF)
-
     for url, params in urls:
         try:
             r = s.get(url, params=params, timeout=10)
             if r.status_code == 200:
                 j = r.json()
-                if isinstance(j, dict) and j.get("aaData"):
+                if isinstance(j, dict):
                     return j
         except Exception:
             continue
-
     return None
 
 
 def parse_tpex_top_by_volume(j: dict) -> List[Dict[str, Any]]:
+    """解析上櫃 JSON（aaData 格式）"""
     rows: List[Dict[str, Any]] = []
     if not isinstance(j, dict):
         return rows
@@ -407,10 +413,11 @@ def parse_tpex_top_by_volume(j: dict) -> List[Dict[str, Any]]:
     for row in data:
         try:
             sid = str(row[0]).strip()
-            if len(sid) != 4 or not sid.isdigit():
+            # 一樣改成 4–6 碼純數字
+            if (not sid.isdigit()) or not (4 <= len(sid) <= 6):
                 continue
             vol = _fmt_int(row[8])
-            if vol is None:
+            if vol is None or vol <= 0:
                 continue
             rows.append(
                 {
@@ -426,6 +433,7 @@ def parse_tpex_top_by_volume(j: dict) -> List[Dict[str, Any]]:
 
 
 def yahoo_fallback(topn: int) -> List[Dict[str, Any]]:
+    """全部官方來源都掛掉時的 Yahoo 備援"""
     try:
         url = (
             "https://query1.finance.yahoo.com/v1/finance/screener/predefined/"
@@ -440,7 +448,7 @@ def yahoo_fallback(topn: int) -> List[Dict[str, Any]]:
             if not (sym.endswith(".TW") or sym.endswith(".TWO")):
                 continue
             sid = sym.split(".")[0]
-            if len(sid) != 4:
+            if not (sid.isdigit() and 4 <= len(sid) <= 6):
                 continue
             rows.append(
                 {
@@ -457,37 +465,42 @@ def yahoo_fallback(topn: int) -> List[Dict[str, Any]]:
 
 @st.cache_data(ttl=1800)
 def get_market_scan_list(limit: int):
+    """整合上市＋上櫃成交量排行；抓不到才用 Yahoo 備援"""
     d = _smart_trade_date()
-    yyyymmdd = d.strftime("%Y%m%d")
-    roc_date = f"{d.year - 1911}/{d.month:02d}/{d.day:02d}"
+    for _ in range(5):
+        yyyymmdd = d.strftime("%Y%m%d")
+        roc_date = f"{d.year - 1911}/{d.month:02d}/{d.day:02d}"
 
-    rows_tw: List[Dict[str, Any]] = []
-    rows_tp: List[Dict[str, Any]] = []
+        rows_tw: List[Dict[str, Any]] = []
+        rows_tp: List[Dict[str, Any]] = []
 
-    j_tw = fetch_twse_json(yyyymmdd)
-    if j_tw:
-        rows_tw = parse_twse_top_by_volume(j_tw)
+        j_tw = fetch_twse_json(yyyymmdd)
+        if j_tw:
+            rows_tw = parse_twse_top_by_volume(j_tw)
 
-    j_tp = fetch_tpex_json(roc_date)
-    if j_tp:
-        rows_tp = parse_tpex_top_by_volume(j_tp)
+        j_tp = fetch_tpex_json(roc_date)
+        if j_tp:
+            rows_tp = parse_tpex_top_by_volume(j_tp)
 
-    if rows_tw or rows_tp:
-        all_data = rows_tw + rows_tp
-        all_data.sort(key=lambda x: x["volume"], reverse=True)
-        return all_data[: limit * 2], d.strftime("%Y-%m-%d")
+        if rows_tw or rows_tp:
+            all_data = rows_tw + rows_tp
+            all_data.sort(key=lambda x: x["volume"], reverse=True)
+            return all_data[: limit * 2], d.strftime("%Y-%m-%d")
 
-    # 官方都掛掉 → Yahoo 熱門備援
-    yahoo_rows = yahoo_fallback(limit)
-    if yahoo_rows:
-        return yahoo_rows, "Yahoo即時(備援)"
+        # 若當天沒資料就往前一天回溯，跳過週末
+        d -= dt.timedelta(days=1)
+        while d.weekday() >= 5:
+            d -= dt.timedelta(days=1)
 
+    fb = yahoo_fallback(limit)
+    if fb:
+        return fb, "Yahoo即時(備援)"
     return [], d.strftime("%Y-%m-%d")
 
 
-# ============================================================
-# 4. yfinance → StockSnapshot
-# ============================================================
+# =========================
+# 四、yfinance → StockSnapshot
+# =========================
 
 def build_snapshot(
     symbol: str,
@@ -495,14 +508,16 @@ def build_snapshot(
     info: Dict[str, Any],
     history: pd.DataFrame,
 ) -> Optional[StockSnapshot]:
+    """把 yfinance 的 info + history 整理成一筆 Snapshot"""
     if history is None or history.empty:
-        return None
-    # 放寬成至少 60 根 K 就算
-    if len(history) < 60:
         return None
 
     hist = history.dropna(subset=["Close", "Volume"])
     if hist.empty:
+        return None
+
+    # 這裡延續你之前的設定：至少 60 根 K 才算「有歷史」
+    if len(hist) < 60:
         return None
 
     last = hist.iloc[-1]
@@ -521,17 +536,16 @@ def build_snapshot(
     opm = float(info.get("operatingMargins") or 0.0)
     rev_growth = float(info.get("revenueGrowth") or 0.0)
 
-    debt_to_equity = info.get("debtToEquity")
-    if isinstance(debt_to_equity, (int, float)):
-        de = float(debt_to_equity) / 100.0
+    # 用 D/E 推算負債比
+    de_ratio = info.get("debtToEquity")
+    if isinstance(de_ratio, (int, float)):
+        de = float(de_ratio) / 100.0
         debt_ratio = de / (1.0 + de)
     else:
         debt_ratio = 0.0
 
     industry = (info.get("industry") or info.get("sector") or "").lower()
-    is_fin = any(
-        k in industry for k in ["bank", "insurance", "financial", "證券", "銀行", "保險"]
-    )
+    is_fin = any(k in industry for k in ["bank", "insurance", "financial", "證券", "銀行", "保險"])
 
     return StockSnapshot(
         symbol=symbol,
@@ -550,9 +564,9 @@ def build_snapshot(
     )
 
 
-# ============================================================
-# 5. Streamlit UI
-# ============================================================
+# =========================
+# 五、Streamlit 介面
+# =========================
 
 st.set_page_config(
     page_title="v7.9.8 選股雷達",
@@ -580,6 +594,7 @@ st.sidebar.info(
 )
 
 if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
+    # 1. 抓成交量排行
     with st.spinner("正在抓取上市＋上櫃成交量排行..."):
         target_list, data_date = get_market_scan_list(scan_limit)
 
@@ -593,18 +608,19 @@ if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    # 統計用
-    empty_hist = short_hist = ok_snap = 0
+    empty_hist = 0   # history 完全空白
+    short_hist = 0   # <60 根 K
+    ok_snap = 0      # 成功算出 Snapshot
+
     scan_targets = target_list[:scan_limit]
 
+    # 2. 逐檔跑 v7.9.8 規則
     for i, meta in enumerate(scan_targets):
         symbol = meta["symbol"]
         name = meta["name"]
 
         progress_bar.progress((i + 1) / len(scan_targets))
-        status_text.text(
-            f"正在分析 [{i+1}/{len(scan_targets)}]: {name} ({symbol}) ..."
-        )
+        status_text.text(f"正在分析 [{i+1}/{len(scan_targets)}]: {name} ({symbol}) ...")
 
         try:
             ticker = yf.Ticker(symbol)
@@ -612,20 +628,55 @@ if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
 
             if hist is None or hist.empty:
                 empty_hist += 1
+                results.append(
+                    {
+                        "代號": symbol,
+                        "名稱": name,
+                        "評級": "X",
+                        "E候選": "",
+                        "收盤價": None,
+                        "成交量": int(meta.get("volume", 0) / 1000),
+                        "基本面": "❌",
+                        "技術面": "❌",
+                        "價格符合": "❌",
+                        "ROE": "-",
+                        "OPM": "-",
+                        "Score": 0,
+                        "LayerReason": "history 空白，無法計算指標",
+                    }
+                )
                 continue
 
             last = hist.iloc[-1]
-            vol_lots_today = float(last["Volume"]) / 1000.0
+            close_today = float(last["Close"])
+            vol_lots_today = int(float(last["Volume"]) / 1000)
 
             info = ticker.info or {}
             snap = build_snapshot(symbol, name, info, hist)
+
             if snap is None:
                 short_hist += 1
+                results.append(
+                    {
+                        "代號": symbol,
+                        "名稱": name,
+                        "評級": "X",
+                        "E候選": "",
+                        "收盤價": round(close_today, 2),
+                        "成交量": vol_lots_today,
+                        "基本面": "❌",
+                        "技術面": "❌",
+                        "價格符合": "❌",
+                        "ROE": "-",
+                        "OPM": "-",
+                        "Score": 0,
+                        "LayerReason": "歷史不足(<60根K)，暫不評分",
+                    }
+                )
                 continue
 
             ok_snap += 1
 
-            # Universe / Firm / Score / 分層
             uni = check_universe(snap, price_cap=max_price)
             firm = check_firm(snap)
             score = calculate_score(snap, firm)
@@ -638,16 +689,14 @@ if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
                     "評級": cls.layer.value,
                     "E候選": "⭐" if cls.is_e_candidate else "",
                     "收盤價": round(snap.close, 2),
-                    "成交量": int(vol_lots_today),
+                    "成交量": int(snap.volume / 1000),
                     "基本面": "✅"
                     if (uni.checks.get("roe") and uni.checks.get("opm"))
                     else "❌",
                     "技術面": "✅"
                     if (firm.f_price and firm.f_trend)
                     else "❌",
-                    "價格符合": "✅"
-                    if uni.checks.get("price")
-                    else "❌",
+                    "價格符合": "✅" if uni.checks.get("price") else "❌",
                     "ROE": f"{snap.roe*100:.1f}%",
                     "OPM": f"{snap.opm*100:.1f}%",
                     "Score": score.total,
@@ -655,7 +704,23 @@ if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
                 }
             )
         except Exception:
-            continue
+            results.append(
+                {
+                    "代號": symbol,
+                    "名稱": name,
+                    "評級": "X",
+                    "E候選": "",
+                    "收盤價": None,
+                    "成交量": int(meta.get("volume", 0) / 1000),
+                    "基本面": "❌",
+                    "技術面": "❌",
+                    "價格符合": "❌",
+                    "ROE": "-",
+                    "OPM": "-",
+                    "Score": 0,
+                    "LayerReason": "抓取 yfinance 資料時發生錯誤",
+                }
+            )
 
     progress_bar.empty()
     status_text.empty()
@@ -666,6 +731,7 @@ if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
         f"成功評分 {ok_snap} 檔"
     )
 
+    # 3. 顯示結果
     if results:
         df = pd.DataFrame(results)
         grade_order = {"A": 0, "B": 1, "C": 2, "D": 3, "X": 4}
@@ -715,4 +781,4 @@ if st.button("🚀 啟動雷達 (v7.9.8)", type="primary"):
         else:
             st.warning("今日無 A/B 級標的。")
     else:
-        st.error("掃描結果為空，請先看上方統計訊息判斷是資料不足還是規則太嚴。")
+        st.error("掃描結果為空。")
